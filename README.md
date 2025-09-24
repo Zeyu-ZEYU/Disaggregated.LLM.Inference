@@ -12,7 +12,7 @@ Launch PD disaggregation by configuring 1 prefill instance and 1 decode instance
 
 In https://docs.vllm.ai/en/latest/examples/online_serving/disaggregated_serving.html, just use disagg_proxy_demo.py.
 launch this proxy demo through:
-```python
+```bash
 python3 examples/online_serving/disaggregated_serving/disagg_proxy_demo.py  \
     --model $model_name \
     --prefill server1_ip:30000 \
