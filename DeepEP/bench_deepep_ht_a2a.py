@@ -1,208 +1,322 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
-DeepEP High-Throughput all-to-all micro-benchmark
-GPU-only, cross-node, NO vLLM parallel_state (no DP/EP init), no MoE GEMM.
+Minimal DeepEP High-Throughput A2A benchmark for inference-side routing.
+- GPU-only process group (no vLLM groups, no DP init)
+- Cross-node friendly: launch with torchrun across nodes
+- Uses DeepEP Buffer.get_dispatch_layout / dispatch / combine as in official example
+- No model compute: we only emulate MoE dispatch+combine to measure A2A performance
 
-Launch (multi-node example):
-  MASTER_ADDR=<master_ip> MASTER_PORT=29500 NNODES=2 NODE_RANK=0 \
-  torchrun --nproc_per_node=8 bench_deepep_ht_a2a_nodp.py
+USAGE (single node, 4 GPUs):
+  torchrun --nproc_per_node=4 bench_deepep_ht_infer_a2a.py
 
-  MASTER_ADDR=<master_ip> MASTER_PORT=29500 NNODES=2 NODE_RANK=1 \
-  torchrun --nproc_per_node=8 bench_deepep_ht_a2a_nodp.py
+USAGE (two nodes, 4 GPUs each):
+  # On ALL nodes, set the same rendezvous envs (or pass as torchrun args)
+  # e.g. MASTER_ADDR, MASTER_PORT, NODE_RANK, WORLD_SIZE=8
+  torchrun --nnodes=2 --nproc_per_node=4 --node_rank=${NODE_RANK} \
+           --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT \
+           bench_deepep_ht_infer_a2a.py \
+           --num-experts 64 --tokens-per-rank 32768 --hidden-size 4096
 
-Optional envs:
-  TOKENS=8192
-  HIDDEN=4096
-  ITERS=50
-  VLLM_DEEPEP_BUFFER_SIZE_MB=256
-  CUDA_DEVICE_MAX_CONNECTIONS=1
+Tuning tips:
+  - For A100, set: TORCH_CUDA_ARCH_LIST="8.0"
+  - Ensure NCCL/IB envs are properly set for cross-node (NCCL_IB=1, NCCL_NET_GDR_LEVEL=5, etc. if applicable)
 """
 
+import argparse
 import os
 import time
+from typing import Optional, Tuple, List, Union
 
 import torch
 import torch.distributed as dist
 
-
-def init_nccl_world():
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    local_rank = int(os.getenv("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank % max(1, torch.cuda.device_count()))
-    os.environ.setdefault("NCCL_ASYNC_ERROR_HANDLING", "1")
-    os.environ.setdefault("NCCL_DEBUG", "WARN")
-    os.environ.setdefault("NCCL_P2P_LEVEL", "NVL")  # prefer NVLink intra-node
+from deep_ep import Buffer, EventOverlap
 
 
-def make_deepep_ht_buffer(world_size: int, rank: int):
+# -----------------------------
+# Utilities
+# -----------------------------
+
+def log(rank: int, *a, **kw):
+    if rank == 0:
+        print(*a, **kw, flush=True)
+
+
+def get_hidden_bytes(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) -> int:
     """
-    Create deep_ep.Buffer for High Throughput mode directly, avoiding vLLM managers.
+    DeepEP HT uses at least 2 bytes granularity for the hidden dimension,
+    so we follow the official example: bytes = hidden * max(elem_size, 2).
     """
-    import deep_ep
+    t = x[0] if isinstance(x, tuple) else x
+    return t.size(1) * max(t.element_size(), 2)
 
-    # Size knobs (bytes); HT uses both NVLink buffers and (if internode) RDMA buffers.
-    buf_mb = int(os.getenv("VLLM_DEEPEP_BUFFER_SIZE_MB", "256"))
-    num_nvl_bytes = buf_mb * 1024 * 1024
 
-    # Detect internode if RANKs span multiple hosts. A simple heuristic is fine here.
-    # You can force internode by setting DEEPEP_INTERNODE=1
-    internode = int(os.getenv("DEEPEP_INTERNODE", "0"))
-    if internode == 0:
-        # Heuristic: if NCCL_SOCKET_IFNAME is set (multi-node typical) assume internode
-        internode = 1 if "NCCL_SOCKET_IFNAME" in os.environ else 0
+def build_inputs(
+    world_size: int,
+    rank: int,
+    tokens_per_rank: int,
+    hidden_size: int,
+    dtype: torch.dtype,
+    topk: int,
+    num_experts: int,
+    seed: int = 1234,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Create synthetic activations and routing for inference-side A2A.
+    - a1      : [T_r, H] tokens on this rank
+    - topk_id : [T_r, topk] with global expert ids in [0, num_experts)
+    - topk_w  : [T_r, topk] softmax-like weights (not used by HT combine but kept for completeness)
+    NOTE: For HT, experts are assumed evenly sharded across ranks:
+          local_experts = num_experts / world_size, contiguous mapping.
+    """
+    assert num_experts % world_size == 0, "num_experts must be divisible by world_size"
+    torch.manual_seed(seed + rank)
 
-    if internode:
-        num_rdma_bytes = buf_mb * 1024 * 1024
-        # Empirically HT 推荐每 rank 多些 QPs；你也可以用 16、32 试
-        num_qps_per_rank = 8
-    else:
-        num_rdma_bytes = 0
-        num_qps_per_rank = 1
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    a1 = torch.randn(tokens_per_rank, hidden_size, dtype=dtype, device=device)
 
-    # Construct Buffer. `group` 直接用 WORLD（GPU group）。
-    buffer = deep_ep.Buffer(
-        group=dist.group.WORLD,
-        num_nvl_bytes=num_nvl_bytes,
-        num_rdma_bytes=num_rdma_bytes,
-        low_latency_mode=False,  # High Throughput mode
-        num_qps_per_rank=num_qps_per_rank,
+    # Create random global expert ids; distribute roughly uniformly
+    # to stress cross-rank traffic.
+    topk_ids = torch.randint(
+        low=0, high=num_experts, size=(tokens_per_rank, topk), device=device, dtype=torch.int32
+    )
+    # Weights could be normalized; here we just make them positive.
+    topk_w = torch.rand(tokens_per_rank, topk, dtype=torch.float32, device=device)
+
+    return a1, topk_ids, topk_w
+
+
+# -----------------------------
+# Core A2A helpers (DeepEP HT)
+# -----------------------------
+
+_buffer: Optional[Buffer] = None  # module-global buffer like the official sample
+
+
+def ensure_buffer(group: dist.ProcessGroup, hidden_bytes: int) -> Buffer:
+    """
+    Allocate/resize DeepEP buffer according to dispatch/combine config hints.
+    We mirror the official example logic.
+    """
+    global _buffer
+
+    # Query size hints from DeepEP configs (pick the max of dispatch/combine)
+    num_nvl_bytes, num_rdma_bytes = 0, 0
+    for cfg in (Buffer.get_dispatch_config(group.size()), Buffer.get_combine_config(group.size())):
+        num_nvl_bytes = max(cfg.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes)
+        num_rdma_bytes = max(cfg.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes)
+
+    if (
+        _buffer is None
+        or _buffer.group != group
+        or _buffer.num_nvl_bytes < num_nvl_bytes
+        or _buffer.num_rdma_bytes < num_rdma_bytes
+    ):
+        _buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes)
+
+    return _buffer
+
+
+def a2a_dispatch_forward(
+    x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+    topk_idx: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_experts: int,
+    previous_event: Optional[EventOverlap] = None,
+):
+    """
+    HT dispatch (forward). Returns the tensors living on *expert owners* after routing,
+    plus a communication handle and event for chaining.
+    """
+    global _buffer
+    # Precompute the token layout (how many tokens go to each rank/expert, etc.)
+    num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank, previous_event = \
+        _buffer.get_dispatch_layout(
+            topk_idx, num_experts,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=(previous_event is not None),
+        )
+
+    recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event = \
+        _buffer.dispatch(
+            x,
+            topk_idx=topk_idx,
+            topk_weights=topk_weights,
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            is_token_in_rank=is_token_in_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=(previous_event is not None),
+        )
+
+    return recv_x, recv_topk_idx, recv_topk_weights, num_recv_tokens_per_expert_list, handle, event
+
+
+def a2a_combine_forward(
+    x: torch.Tensor,
+    handle,
+    previous_event: Optional[EventOverlap] = None,
+):
+    """
+    HT combine (forward): gather results back to the original token owners in order.
+    """
+    global _buffer
+    combined_x, _, event = _buffer.combine(
+        x,
+        handle,
+        async_finish=True,
+        previous_event=previous_event,
+        allocate_on_comm_stream=(previous_event is not None),
+    )
+    return combined_x, event
+
+
+# -----------------------------
+# Benchmark
+# -----------------------------
+
+def benchmark_once(
+    a1: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_w: torch.Tensor,
+    num_experts: int,
+    do_fake_expert_compute: bool = True,
+):
+    """
+    One end-to-end A2A pass:
+      1) dispatch to expert owners
+      2) (optional) fake expert compute
+      3) combine back to token owners
+    Returns elapsed time in seconds.
+    """
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+
+    # (1) dispatch
+    recv_x, recv_topk_idx, recv_topk_w, num_recv_per_expert, handle, ev_d = a2a_dispatch_forward(
+        a1, topk_ids, topk_w, num_experts
     )
 
-    # 控制通信占用 SM 数（HT 内核用 SM 做 pack/copy）。可以收紧到 20，或按你 GPU 调整。
-    try:
-        deep_ep.Buffer.set_num_sms(20)
-    except Exception:
-        pass
+    # (2) fake expert compute (e.g., scaling); ensure it runs on compute stream
+    if do_fake_expert_compute and recv_x.numel() > 0:
+        # A tiny fused op to simulate some work; keep it memory-bound.
+        recv_x.mul_(1.0001)
 
-    return buffer
+    # (3) combine
+    combined_x, ev_c = a2a_combine_forward(recv_x, handle, previous_event=ev_d)
+
+    # Wait for combine to finish
+    if ev_c.event is not None:
+        ev_c.current_stream_wait()
+
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    return t1 - t0, combined_x
 
 
 def main():
-    # Tunables
-    tokens_per_rank = int(os.getenv("TOKENS", "8192"))
-    hidden = int(os.getenv("HIDDEN", "4096"))
-    iters = int(os.getenv("ITERS", "50"))
-    os.environ.setdefault("VLLM_DEEPEP_BUFFER_SIZE_MB", "256")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tokens-per-rank", type=int, default=32768,
+                        help="Number of input tokens on each rank.")
+    parser.add_argument("--hidden-size", type=int, default=4096,
+                        help="Hidden size per token.")
+    parser.add_argument("--dtype", type=str, choices=["bf16", "fp16"], default="bf16",
+                        help="Activation dtype for dispatch/combine. HT combine expects bf16.")
+    parser.add_argument("--num-experts", type=int, default=64,
+                        help="Global number of experts (must be divisible by world size).")
+    parser.add_argument("--topk", type=int, default=1,
+                        help="Experts per token (HT example typically uses topk=1).")
+    parser.add_argument("--iters", type=int, default=20,
+                        help="Number of measured iterations.")
+    parser.add_argument("--warmup", type=int, default=5,
+                        help="Warmup iterations (not timed).")
+    parser.add_argument("--num-sms", type=int, default=24,
+                        help="DeepEP Buffer.set_num_sms value.")
+    parser.add_argument("--no-fake-compute", action="store_true",
+                        help="Disable fake expert compute between dispatch and combine.")
+    args = parser.parse_args()
 
-    init_nccl_world()
+    # --- init distributed ---
+    dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
-    world = dist.get_world_size()
+    world_size = dist.get_world_size()
 
-    # --- Prepare deep_ep.Buffer (HT) and PF driver ---
-    buffer = make_deepep_ht_buffer(world, rank)
+    # pin GPU
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
 
-    from vllm.model_executor.layers.fused_moe.config import (
-        FUSED_MOE_UNQUANTIZED_CONFIG,
+    # dtype selection
+    dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    if args.dtype == "fp16":
+        # DeepEP HT combine currently assumes bf16; we'll still run,
+        # but it's recommended to benchmark with bf16 for realistic paths.
+        pass
+
+    # DeepEP static knob: how many SMs comm kernels may use
+    Buffer.set_num_sms(args.num_sms)
+
+    if args.num_experts % world_size != 0:
+        if rank == 0:
+            print(f"[WARN] num_experts {args.num_experts} is not divisible by world_size {world_size}. "
+                  f"DeepEP HT assumes even shard; rounding up to a multiple.")
+        # round up to multiple for safety
+        new_ne = ((args.num_experts + world_size - 1) // world_size) * world_size
+        args.num_experts = new_ne
+
+    # --- build inputs ---
+    a1, topk_ids, topk_w = build_inputs(
+        world_size=world_size,
+        rank=rank,
+        tokens_per_rank=args.tokens_per_rank,
+        hidden_size=args.hidden_size,
+        dtype=dtype,
+        topk=args.topk,
+        num_experts=args.num_experts,
     )
-    from vllm.model_executor.layers.fused_moe.deepep_ht_prepare_finalize import (
-        DeepEPHTPrepareAndFinalize,
-    )
-    from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
-        TopKWeightAndReduceContiguous,
-    )
 
-    # One local expert per rank in this micro-bench
-    num_experts = world
-    n_local_experts = 1
-    rank_expert_offset = rank * n_local_experts
+    # --- allocate / resize DeepEP buffer ---
+    hidden_bytes = get_hidden_bytes(a1)
+    # use the default global process group as the GPU group
+    buffer = ensure_buffer(dist.group.WORLD, hidden_bytes)  # noqa: F841 (held by global _buffer)
 
-    pf = DeepEPHTPrepareAndFinalize(
-        buffer=buffer,
-        num_dispatchers=world,  # EP world size
-        dp_size=1,  # no data-parallelism here
-        rank_expert_offset=rank_expert_offset,
-    )
+    # --- barrier before timing ---
+    dist.barrier()
 
-    # Inputs on GPU (BF16 recommended for HT path)
-    x = torch.randn(tokens_per_rank, hidden, device="cuda", dtype=torch.bfloat16)
-
-    # Trivial routing: send everything to this rank (top-1); you can randomize to stress a2a
-    topk_ids = torch.full((tokens_per_rank, 1), rank, device="cuda", dtype=torch.int64)
-    topk_weights = torch.ones((tokens_per_rank, 1), device="cuda", dtype=torch.bfloat16)
-
-    quant_config = FUSED_MOE_UNQUANTIZED_CONFIG  # simplest path
-    apply_router_weight_on_input = False
-    expert_map = None
-
-    # Warmup
-    for _ in range(5):
-        receiver = pf.prepare_async(
-            a1=x,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            num_experts=num_experts,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            quant_config=quant_config,
+    # --- warmup ---
+    for _ in range(args.warmup):
+        dt, _ = benchmark_once(
+            a1, topk_ids, topk_w,
+            num_experts=args.num_experts,
+            do_fake_expert_compute=(not args.no_fake_compute),
         )
-        (
-            expert_x,
-            expert_x_scale,
-            expert_tokens_meta,
-            expert_topk_ids,
-            expert_topk_weights,
-        ) = receiver()
-        fused_expert_output = expert_x.to(torch.bfloat16)  # HT combine expects BF16
-        out = torch.empty(tokens_per_rank, hidden, device="cuda", dtype=torch.bfloat16)
-        pf.finalize(
-            output=out,
-            fused_expert_output=fused_expert_output,
-            topk_weights=expert_topk_weights
-            if expert_topk_weights is not None
-            else topk_weights,
-            topk_ids=expert_topk_ids,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            weight_and_reduce_impl=TopKWeightAndReduceContiguous(),
-        )
-        torch.cuda.synchronize()
 
-    # Benchmark
-    torch.cuda.synchronize()
-    t0 = time.time()
-    for _ in range(iters):
-        receiver = pf.prepare_async(
-            a1=x,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            num_experts=num_experts,
-            expert_map=expert_map,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            quant_config=quant_config,
+    # --- measure ---
+    times = []
+    for _ in range(args.iters):
+        dt, _ = benchmark_once(
+            a1, topk_ids, topk_w,
+            num_experts=args.num_experts,
+            do_fake_expert_compute=(not args.no_fake_compute),
         )
-        (
-            expert_x,
-            expert_x_scale,
-            expert_tokens_meta,
-            expert_topk_ids,
-            expert_topk_weights,
-        ) = receiver()
-        fused_expert_output = expert_x.to(torch.bfloat16)
-        out = torch.empty(tokens_per_rank, hidden, device="cuda", dtype=torch.bfloat16)
-        pf.finalize(
-            output=out,
-            fused_expert_output=fused_expert_output,
-            topk_weights=expert_topk_weights
-            if expert_topk_weights is not None
-            else topk_weights,
-            topk_ids=expert_topk_ids,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            weight_and_reduce_impl=TopKWeightAndReduceContiguous(),
-        )
-    torch.cuda.synchronize()
-    t1 = time.time()
+        times.append(dt)
 
-    total_tokens = tokens_per_rank * world * iters
-    elapsed = max(t1 - t0, 1e-9)
-    mtok_s = total_tokens / elapsed / 1e6
-    if rank == 0:
-        print(
-            f"[DeepEP-HT][No-DP] world={world} hidden={hidden} tokens/rank={tokens_per_rank} iters={iters}"
-        )
-        print(
-            f"[DeepEP-HT][No-DP] time={elapsed:.3f}s  tokens={total_tokens}  throughput={mtok_s:.3f} MTok/s"
-        )
+    # --- aggregate ---
+    t = torch.tensor([sum(times) / len(times)], device=a1.device)
+    dist.all_reduce(t, op=dist.ReduceOp.AVG)
+    avg_s = float(t.item())
+
+    # Effective routed tokens per second = (tokens_per_rank * world_size) / avg_time
+    eff_tps = (args.tokens_per_rank * world_size) / max(avg_s, 1e-9)
+    log(rank, f"[DeepEP-HT A2A] world_size={world_size}, experts={args.num_experts}, topk={args.topk}, "
+              f"hidden={args.hidden_size}, dtype={args.dtype}, num_sms={args.num_sms}")
+    log(rank, f"  tokens_per_rank={args.tokens_per_rank}, warmup={args.warmup}, iters={args.iters}")
+    log(rank, f"  avg latency per pass = {avg_s*1000:.3f} ms")
+    log(rank, f"  effective routed tokens/s (global) ≈ {eff_tps:,.0f}")
 
     dist.destroy_process_group()
 
