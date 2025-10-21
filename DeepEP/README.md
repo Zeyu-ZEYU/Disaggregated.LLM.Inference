@@ -34,10 +34,10 @@
         # 可选：NCCL_SOCKET_IFNAME/NCCL_IB_HCA/NCCL_NET_GDR_LEVEL...
 
         # 节点 0：
-        torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 bench_deepep_ht_a2a.py.py \
+        torchrun --nnodes=2 --nproc_per_node=4 --node_rank=0 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT bench_deepep_ht_a2a.py.py \
         --num-experts 64 --tokens-per-rank 32768 --hidden-size 4096
 
         # 节点 1：
-        torchrun --nnodes=2 --nproc_per_node=4 --node_rank=1 bench_deepep_ht_a2a.py.py \
+        torchrun --nnodes=2 --nproc_per_node=4 --node_rank=1 --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT bench_deepep_ht_a2a.py.py \
         --num-experts 64 --tokens-per-rank 32768 --hidden-size 4096
         ```
