@@ -684,6 +684,13 @@ class LMCacheConnectorV1Impl:
                             f"extra config: {value}"
                         )
 
+        # Force-enable layerwise flushing on the producer (prefill) side for PD disaggregation.
+        if self.kv_role == "kv_producer":
+            config.use_layerwise = True
+            logger.info(
+                "Force enabled lmcache.use_layerwise=True for kv_producer (prefill)."
+            )
+
         self.config = config
 
         self.async_loading = config.enable_async_loading
@@ -823,6 +830,14 @@ class LMCacheConnectorV1Impl:
             "lmcache cache_engine metadata: "
             f"{getattr(self.lmcache_engine, 'metadata', None)}"
         )
+
+        # Track flushed boundary (absolute token index) per request.
+        # Always aligned to chunk boundary (i.e., skip + k * chunk_size).
+        self._sent_upto_aligned: dict[str, int] = {}
+
+        # Track the last observed "prefill end" per request (absolute token index).
+        # Used to flush tail (<1 chunk) at wait_for_save.
+        self._last_end_seen: dict[str, int] = {}
 
     def _setup_metrics(self):
         """Setup metrics for monitoring data structures in the connector."""
@@ -1172,16 +1187,7 @@ class LMCacheConnectorV1Impl:
         attn_metadata: "AttentionMetadata",
         **kwargs,
     ) -> None:
-        """Start saving the a layer of KV cache from vLLM's paged buffer
-        to the connector.
-
-        Args:
-            layer_name (str): the name of the layer.
-            kv_layer (torch.Tensor): the paged KV buffer of the current
-                layer in vLLM.
-            attn_metadata (AttentionMetadata): the attention metadata.
-            **kwargs: additional arguments for the save operation.
-        """
+        """Start saving a layer of KV cache from vLLM's paged buffer to the connector."""
         assert self.lmcache_engine is not None
 
         if not self.use_layerwise:
@@ -1190,20 +1196,27 @@ class LMCacheConnectorV1Impl:
         if self.kv_role == "kv_consumer":
             # Don't do save if the role is kv_consumer
             return
+
         if self._parent._connector_metadata is None:
             logger.warning(
                 "In connector.save_kv_layer, but the connector metadata is None"
             )
             return
+
         connector_metadata = self._parent._get_connector_metadata()
         assert isinstance(connector_metadata, LMCacheConnectorMetadata)
 
         assert len(self.kv_caches) > 0
 
+        # ---- NEW: init per-request flush bookkeeping (lazy init to avoid crashes) ----
+        # Track how many tokens have been flushed (aligned to chunk boundary) per request.
+        if not hasattr(self, "_sent_upto_aligned"):
+            self._sent_upto_aligned = {}  # type: ignore[attr-defined]
+
         kvcaches = list(self.kv_caches.values())
+
         if self.current_layer == 0:
             self.layerwise_storers = []
-
             is_first = True
 
             for idx, request in enumerate(connector_metadata.requests):
@@ -1225,30 +1238,69 @@ class LMCacheConnectorV1Impl:
                     skip_leading_tokens = 0
                 else:
                     skip_leading_tokens = save_spec.skip_leading_tokens
-
                     if skip_leading_tokens == len(token_ids):
                         continue  # skip this request
-                    # Align to lmcache chunk size
+
+                    # Align to lmcache chunk size (existing behavior)
                     skip_leading_tokens = (
                         skip_leading_tokens
                         // self._lmcache_chunk_size
                         * self._lmcache_chunk_size
                     )
 
-                store_mask = torch.ones(len(token_ids), dtype=torch.bool)
-                store_mask[:skip_leading_tokens] = False
+                # ---- NEW: only flush NEW FULL chunks to avoid re-sending boundary chunks ----
+                # We assume that by the time save_kv_layer is called for this request,
+                # KV for all tokens after skip_leading_tokens is valid (same assumption as original code).
+                end = len(token_ids)
+
+                # Align end down to chunk boundary.
+                end_aligned = (
+                    skip_leading_tokens
+                    + ((end - skip_leading_tokens) // self._lmcache_chunk_size)
+                    * self._lmcache_chunk_size
+                )
+
+                prev_sent = self._sent_upto_aligned.get(
+                    request.req_id, skip_leading_tokens
+                )  # type: ignore[attr-defined]
+                # Safety clamp
+                if prev_sent < skip_leading_tokens:
+                    prev_sent = skip_leading_tokens
+                if prev_sent > end_aligned:
+                    prev_sent = end_aligned
+
+                # No new full chunk -> create a no-op storer for this request (so later loop stays simple)
+                if prev_sent >= end_aligned:
+                    # Still append a dummy generator that yields immediately.
+                    def _noop_gen():
+                        if False:
+                            yield None
+
+                    self.layerwise_storers.append(_noop_gen())
+                    continue
+
+                # Build mask over the full token_ids length, but only mark [prev_sent, end_aligned).
+                store_mask = torch.zeros(len(token_ids), dtype=torch.bool)
+                store_mask[prev_sent:end_aligned] = True
+                # Ensure we never store before skip_leading_tokens.
+                if skip_leading_tokens > 0:
+                    store_mask[:skip_leading_tokens] = False
 
                 logger.info(
-                    "Storing KV cache for %d out of %d tokens "
-                    "(skip_leading_tokens=%d) for request %s",
-                    len(token_ids) - skip_leading_tokens,
+                    "Layerwise storing KV cache for %d NEW tokens out of %d tokens "
+                    "(skip_leading_tokens=%d, prev_sent=%d, end_aligned=%d) for request %s",
+                    int(store_mask.sum().item()),
                     len(token_ids),
                     skip_leading_tokens,
+                    prev_sent,
+                    end_aligned,
                     request.req_id,
                 )
 
-                # TODO (Jiayi): need to make layerwise storing
-                # compatible with disagg spec
+                # ---- NEW: make layerwise storing compatible with disagg spec ----
+                # request.disagg_spec should exist in PD-disagg path; use getattr to be safe.
+                transfer_spec = getattr(request, "disagg_spec", None)
+
                 layerwise_storer = self.lmcache_engine.store_layer(
                     token_ids,
                     mask=store_mask,
@@ -1257,11 +1309,17 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    transfer_spec=transfer_spec,
                 )
                 self.layerwise_storers.append(layerwise_storer)
+
+                # Update sent boundary immediately (we're committing to sending these full chunks).
+                self._sent_upto_aligned[request.req_id] = end_aligned  # type: ignore[attr-defined]
+
                 if is_first:
                     is_first = False
 
+        # Advance all per-request layerwise storers once for this layer.
         for layerwise_storer in self.layerwise_storers:
             next(layerwise_storer)
 
@@ -1279,12 +1337,41 @@ class LMCacheConnectorV1Impl:
             return
 
         if self.use_layerwise:
-            for layerwise_storer in self.layerwise_storers:
-                next(layerwise_storer)
+            # Flush tail tokens (<1 chunk) once at the end, to guarantee correctness.
+            for request in self._get_requests_need_store_somehow():
+                token_ids = request.token_ids
+                skip = (
+                    request.skip_leading_tokens
+                )  # If our request does not have this field, then use the original one.
+                end = self._last_end_seen.get(request.req_id, len(token_ids))
+                sent = self._sent_upto_aligned.get(request.req_id, skip)
 
-            # unpin the kv caches according to req_id
-            for request in connector_metadata.requests:
-                self.lmcache_engine.lookup_unpin(request.req_id)
+                if sent >= end:
+                    continue  # no tail
+
+                # Tail mask: [sent, end)
+                mask_len = len(token_ids) - skip
+                tail_mask = torch.zeros(mask_len, dtype=torch.bool, device="cpu")
+                tail_mask[(sent - skip) : (end - skip)] = True
+
+                slot_mapping = request.slot_mapping
+                if len(slot_mapping) == len(token_ids):
+                    slot_mapping = slot_mapping[skip:]
+
+                # IMPORTANT: flush all layers at once using store(), simplest and avoids per-layer loop.
+                self.lmcache_engine.store(
+                    token_ids,
+                    mask=tail_mask,
+                    kvcaches=request.kvcaches_all_layers,  # you already have full kvcaches in wait_for_save path
+                    slot_mapping=slot_mapping,
+                    offset=skip,
+                    transfer_spec=request.disagg_spec,
+                    request_configs=request.request_configs,
+                    req_id=request.req_id,
+                )
+
+                self._sent_upto_aligned[request.req_id] = end
+
             return
 
         assert len(self.kv_caches) > 0
@@ -1889,3 +1976,15 @@ class LMCacheConnectorV1Impl:
         if self.lmcache_engine is not None:
             return self.lmcache_engine.get_kv_events()
         return []
+
+    def _get_chunk_size(self) -> int:
+        # Try common places; adjust if your config uses a different name.
+        for attr in ("chunk_size", "tokens_per_chunk", "kv_chunk_size"):
+            if hasattr(self.lmcache_engine, attr):
+                return int(getattr(self.lmcache_engine, attr))
+            if hasattr(self.lmcache_engine, "config") and hasattr(
+                self.lmcache_engine.config, attr
+            ):
+                return int(getattr(self.lmcache_engine.config, attr))
+        # Conservative default (you should replace this with your real chunk size if different)
+        return 256

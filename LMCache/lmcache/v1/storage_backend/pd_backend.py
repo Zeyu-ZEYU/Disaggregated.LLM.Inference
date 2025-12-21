@@ -179,13 +179,18 @@ class PDBackend(AllocatorBackendInterface):
                 self.pd_config.peer_init_port
             )
 
+        if self.pd_config.role == "receiver":
+            buf_alloc = self.memory_allocator.cpu_allocator
+        else:
+            buf_alloc = self.memory_allocator.gpu_allocator
+
         self.transfer_channel = CreateTransferChannel(
             async_mode=False,
             channel_type=config.transfer_channel,
             role=self.pd_config.role,
-            buffer_ptr=self.memory_allocator.gpu_allocator.buffer_ptr,
-            buffer_size=self.memory_allocator.gpu_allocator.buffer_size,
-            align_bytes=self.memory_allocator.gpu_allocator.align_bytes,
+            buffer_ptr=buf_alloc.buffer_ptr,
+            buffer_size=buf_alloc.buffer_size,
+            align_bytes=buf_alloc.align_bytes,
             tp_rank=self.tp_rank,
             peer_init_url=peer_init_url,
             backends=config.nixl_backends,
@@ -221,13 +226,24 @@ class PDBackend(AllocatorBackendInterface):
         torch.cuda.set_device(corrected_device)
 
         paged_mem_allocator = PagedCpuGpuMemoryAllocator()
-        paged_mem_allocator.init_gpu_memory_allocator(
-            config.pd_buffer_size,
-            [torch.Size(metadata.kv_shape)],
-            [metadata.kv_dtype],
-            MemoryFormat.KV_2LTD,  # TODO: remove this hardcode
-            corrected_device,
-        )
+
+        # ✅ receiver landing zone: CPU pinned pool
+        if config.pd_role == "receiver":
+            paged_mem_allocator.init_cpu_memory_allocator(
+                config.pd_buffer_size,
+                [torch.Size(metadata.kv_shape)],
+                [metadata.kv_dtype],
+                MemoryFormat.KV_2LTD,
+                numa_mapping=None,
+            )
+        else:
+            paged_mem_allocator.init_gpu_memory_allocator(
+                config.pd_buffer_size,
+                [torch.Size(metadata.kv_shape)],
+                [metadata.kv_dtype],
+                MemoryFormat.KV_2LTD,
+                corrected_device,
+            )
 
         return paged_mem_allocator
 
@@ -248,8 +264,9 @@ class PDBackend(AllocatorBackendInterface):
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD
         # NOTE: no eviction and busy_loop in PD
+        allocator_type = "cpu" if self.pd_config.role == "receiver" else "gpu"
         return self.memory_allocator.allocate(
-            shapes, dtypes, fmt=fmt, allocator_type="gpu"
+            shapes, dtypes, fmt=fmt, allocator_type=allocator_type
         )
 
     # TODO(Jiayi): Please implement batched allocate to reduce memory
@@ -265,8 +282,9 @@ class PDBackend(AllocatorBackendInterface):
     ):
         if fmt is None:
             fmt = MemoryFormat.KV_2LTD
+        allocator_type = "cpu" if self.pd_config.role == "receiver" else "gpu"
         return self.memory_allocator.batched_allocate(
-            shapes, dtypes, batch_size, fmt, allocator_type="gpu"
+            shapes, dtypes, batch_size, fmt, allocator_type=allocator_type
         )
 
     # NOTE(Jiayi): If two requests have overlapped keys, will
