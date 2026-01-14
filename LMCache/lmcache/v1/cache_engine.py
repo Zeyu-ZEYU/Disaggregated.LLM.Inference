@@ -652,10 +652,15 @@ class LMCacheEngine:
 
             next(mem_obj_generator)
 
+            transfer_spec = kwargs.get("transfer_spec", None)
             for layer_id in range(self.num_layers):
                 yield
                 next(mem_obj_generator)
-                self.storage_manager.batched_put(keys[layer_id], memory_objs[layer_id])
+                self.storage_manager.batched_put(
+                    keys[layer_id],
+                    memory_objs[layer_id],
+                    transfer_spec=transfer_spec,
+                )
         else:
             # If no cache are found, we still need to yield to avoid
             # `StopIteration`

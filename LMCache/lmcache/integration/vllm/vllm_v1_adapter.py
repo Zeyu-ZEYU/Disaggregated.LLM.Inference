@@ -495,6 +495,17 @@ class LMCacheConnectorV1Impl:
                             config_key,
                             value,
                         )
+        # ---- BEGIN: minimal overlap MVP ----
+        # Enable layer-wise saving only on prefill (kv_producer). Keep decode (kv_consumer)
+        # on one-shot retrieve path for simplicity and stability.
+        if self.kv_role == "kv_producer":
+            config.use_layerwise = True
+            logger.info("[LMCache] Force enable use_layerwise=True on kv_producer (prefill).")
+        else:
+            # Explicitly disable to avoid accidentally enabling layerwise on decode.
+            config.use_layerwise = False
+            logger.info("[LMCache] Force keep use_layerwise=False on kv_consumer (decode).")
+        # ---- END: minimal overlap MVP ----
 
     def _init_connector_state(
         self,
@@ -1054,6 +1065,8 @@ class LMCacheConnectorV1Impl:
                     offset=skip_leading_tokens,
                     sync=is_first,
                     req_id=request.req_id,
+                    # IMPORTANT: make layerwise storing actually perform PD/disagg transfer
+                    transfer_spec=request.disagg_spec,
                 )
                 self.layerwise_storers.append(layerwise_storer)
                 if is_first:
