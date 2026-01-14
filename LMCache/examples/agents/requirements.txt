@@ -1,4 +1,0 @@
-transformers
-matplotlib
-tqdm
-torch
